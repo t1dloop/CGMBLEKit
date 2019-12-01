@@ -9,16 +9,27 @@ import UIKit
 import UserNotifications
 
 class CompletionViewController: UITableViewController {
+    struct Data {
+        let title: String
+        let message: String
+    }
 
     @IBOutlet weak var textView: UITextView!
+
+    @IBOutlet weak var navBar: UINavigationItem!
+
+    var data: Data?
 
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        navBar.title = data?.title
+        textView.text = data?.message
+
         if UIApplication.shared.applicationState == .background {
             let content = UNMutableNotificationContent()
             content.badge = 1
-            content.title = NSLocalizedString("Transmitter Reset Complete", comment: "Notification title for background completion notification")
+            content.title = navBar.title!
             content.body = textView.text
             content.sound = .default
 

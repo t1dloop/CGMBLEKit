@@ -1,5 +1,5 @@
 //
-//  ResetViewController.swift
+//  TransmitterViewController.swift
 //  ResetTransmitter
 //
 //  Copyright © 2018 LoopKit Authors. All rights reserved.
@@ -9,15 +9,17 @@ import UIKit
 import UserNotifications
 
 
-class ResetViewController: UITableViewController {
+class TransmitterViewController: UITableViewController {
 
     private enum State {
         case empty
         case needsConfiguration
         case configured
-        case resetting
+        case actioning
         case completed
     }
+
+    var mode: Mode = .restart
 
     private var state: State = .empty {
         didSet {
@@ -29,6 +31,7 @@ class ResetViewController: UITableViewController {
             updateButtonState()
             updateTransmitterIDFieldState()
             updateStatusIndicatorState()
+            updateBackButtonState()
 
             if state == .completed {
                 performSegue(withIdentifier: "CompletionViewController", sender: self)
@@ -36,9 +39,24 @@ class ResetViewController: UITableViewController {
         }
     }
 
+    override func prepare(for segue: UIStoryboardSegue, sender: Any?) {
+        if let destinationViewController = segue.destination as? CompletionViewController {
+            switch transmitterManager.state {
+            case let .completed(title, message):
+                destinationViewController.data = CompletionViewController.Data(title: title, message: message)
+            default:
+                return
+            }
+        }
+    }
+
+    @IBOutlet weak var navBar: UINavigationItem!
+
+    @IBOutlet weak var informativeText: ParagraphView!
+
     @IBOutlet var hairlines: [UIView]!
 
-    @IBOutlet weak var resetButton: Button!
+    @IBOutlet weak var actionButton: Button!
 
     @IBOutlet weak var transmitterIDField: TextField!
 
@@ -52,8 +70,14 @@ class ResetViewController: UITableViewController {
 
     private var lastError: Error?
 
-    private lazy var resetManager: ResetManager = {
-        let manager = ResetManager()
+    private lazy var transmitterManager: TransmitterManager = {
+        let manager: TransmitterManager
+        switch mode {
+        case .restart:
+            manager = RestartManager()
+        case .reset:
+            manager = ResetManager()
+        }
         manager.delegate = self
         return manager
     }()
@@ -69,6 +93,9 @@ class ResetViewController: UITableViewController {
 
         self.navigationController?.delegate = self
         self.navigationController?.navigationBar.shadowImage = UIImage()
+    
+        self.navBar.title = String(describing: mode)
+        self.informativeText.text = mode.blurb
 
         state = .needsConfiguration
     }
@@ -119,32 +146,32 @@ class ResetViewController: UITableViewController {
             break
         case .configured:
             // Begin reset
-            resetTransmitter(withID: transmitterIDField.text ?? "")
-        case .resetting:
+            manageTransmitter(withID: transmitterIDField.text ?? "")
+        case .actioning:
             // Cancel pending reset
-            resetManager.cancel()
+            transmitterManager.cancel()
         case .completed:
             // Ignore actions here
             break
         }
     }
 
-    private func resetTransmitter(withID id: String) {
+    private func manageTransmitter(withID id: String) {
         let controller = UIAlertController(
-            title: NSLocalizedString("Are you sure you want to reset this transmitter?", comment: "Title of the reset confirmation sheet"),
-            message: NSLocalizedString("It will take up to 10 minutes to complete.", comment: "Message of the reset confirmation sheet"), preferredStyle: .actionSheet
+            title: mode.alertTitle,
+            message: mode.alertMessage, preferredStyle: .actionSheet
         )
 
         controller.addAction(UIAlertAction(
-            title: NSLocalizedString("Reset", comment: "Reset button title"),
+            title: mode.buttonTitle,
             style: .destructive,
             handler: { (action) in
-                self.resetManager.resetTransmitter(withID: id)
+                self.transmitterManager.manage(withID: id)
             }
         ))
 
         controller.addAction(UIAlertAction(
-            title: NSLocalizedString("Cancel", comment: "Title of button to cancel reset"),
+            title: NSLocalizedString("Cancel", comment: "Title of button to cancel action"),
             style: .cancel,
             handler: nil
         ))
@@ -155,22 +182,22 @@ class ResetViewController: UITableViewController {
 
 
 // MARK: - UI state management
-extension ResetViewController {
+extension TransmitterViewController {
     private func updateButtonState() {
         switch state {
         case .empty, .needsConfiguration:
-            resetButton.isEnabled = false
-        case .configured, .resetting, .completed:
-            resetButton.isEnabled = true
+            actionButton.isEnabled = false
+        case .configured, .actioning, .completed:
+            actionButton.isEnabled = true
         }
 
         switch state {
         case .empty, .needsConfiguration, .configured:
-            resetButton.setTitle(NSLocalizedString("Reset", comment: "Title of button to begin reset"), for: .normal)
-            resetButton.tintColor = .red
-        case .resetting, .completed:
-            resetButton.setTitle(NSLocalizedString("Cancel", comment: "Title of button to cancel reset"), for: .normal)
-            resetButton.tintColor = .darkGray
+            actionButton.setTitle(mode.buttonTitle, for: .normal)
+            actionButton.tintColor = .red
+        case .actioning, .completed:
+            actionButton.setTitle(NSLocalizedString("Cancel", comment: "Title of button to cancel reset"), for: .normal)
+            actionButton.tintColor = .darkGray
         }
     }
 
@@ -181,17 +208,17 @@ extension ResetViewController {
             transmitterIDField.isEnabled = true
         case .configured:
             transmitterIDField.isEnabled = true
-        case .resetting, .completed:
+        case .actioning, .completed:
             transmitterIDField.isEnabled = false
         }
     }
 
     private func updateStatusIndicatorState() {
-        switch self.state {
+        switch state {
         case .empty, .needsConfiguration, .configured, .completed:
             self.spinner.stopAnimating()
             self.errorLabel.superview?.isHidden = true
-        case .resetting:
+        case .actioning:
             self.spinner.startAnimating()
             if let error = lastError {
                 self.errorLabel.text = String(describing: error)
@@ -200,24 +227,33 @@ extension ResetViewController {
                     (self.lastError == nil)
         }
     }
+
+    private func updateBackButtonState() {
+        switch state {
+        case .empty, .needsConfiguration, .configured, .completed:
+            navBar.setHidesBackButton(false, animated: true)
+        case .actioning:
+            navBar.setHidesBackButton(true, animated: true)
+        }
+    }
 }
 
 
-extension ResetViewController: ResetManagerDelegate {
-    func resetManager(_ manager: ResetManager, didError error: Error) {
+extension TransmitterViewController: TransmitterManagerDelegate {
+    func transmitterManager(_ manager: TransmitterManager, didError error: Error) {
         DispatchQueue.main.async {
             self.lastError = error
             self.updateStatusIndicatorState()
         }
     }
 
-    func resetManager(_ manager: ResetManager, didChangeStateFrom oldState: ResetManager.State) {
+    func transmitterManager(_ manager: TransmitterManager, didChangeStateFrom oldState: TransmitterManager.State) {
         DispatchQueue.main.async {
             switch manager.state {
             case .initialized:
                 self.state = .configured
-            case .resetting:
-                self.state = .resetting
+            case .actioning:
+                self.state = .actioning
             case .completed:
                 self.state = .completed
             }
@@ -225,13 +261,13 @@ extension ResetViewController: ResetManagerDelegate {
     }
 }
 
-extension ResetViewController: UINavigationControllerDelegate {
+extension TransmitterViewController: UINavigationControllerDelegate {
     func navigationControllerSupportedInterfaceOrientations(_ navigationController: UINavigationController) -> UIInterfaceOrientationMask {
         return .portrait
     }
 }
 
-extension ResetViewController: UITextFieldDelegate {
+extension TransmitterViewController: UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         textField.resignFirstResponder()
         return false

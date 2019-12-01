@@ -126,7 +126,7 @@ class TransmitterViewController: UITableViewController {
             }
         }
 
-        return UITableViewAutomaticDimension
+        return UITableView.automaticDimension
     }
 
     override func tableView(_ tableView: UITableView, shouldHighlightRowAt indexPath: IndexPath) -> Bool {

@@ -17,9 +17,10 @@ protocol BluetoothManagerDelegate: class {
      Tells the delegate that the bluetooth manager has finished connecting to and discovering all required services of its peripheral, or that it failed to do so
 
      - parameter manager: The bluetooth manager
+     - parameter peripheralManager: The peripheral manager
      - parameter error:   An error describing why bluetooth setup failed
      */
-    func bluetoothManager(_ manager: BluetoothManager, isReadyWithError error: Error?)
+    func bluetoothManager(_ manager: BluetoothManager, peripheralManager: PeripheralManager, isReadyWithError error: Error?)
 
     /**
      Asks the delegate whether the discovered or restored peripheral should be connected
@@ -44,19 +45,36 @@ protocol BluetoothManagerDelegate: class {
     ///   - manager: The bluetooth manager
     ///   - response: The data received on the backfill characteristic
     func bluetoothManager(_ manager: BluetoothManager, didReceiveBackfillResponse response: Data)
+
+    /// Informs the delegate that the bluetooth manager received new data in the authentication characteristic
+    ///
+    /// - Parameters:
+    ///   - manager: The bluetooth manager
+    ///   - response: The data received on the authentication characteristic
+    func bluetoothManager(_ manager: BluetoothManager, peripheralManager: PeripheralManager, didReceiveAuthenticationResponse response: Data)
 }
 
 
 class BluetoothManager: NSObject {
 
-    var stayConnected = true
+    var stayConnected: Bool {
+        get {
+            return lockedStayConnected.value
+        }
+        set {
+            lockedStayConnected.value = newValue
+        }
+    }
+    private let lockedStayConnected: Locked<Bool> = Locked(true)
 
     weak var delegate: BluetoothManagerDelegate?
 
     private let log = OSLog(category: "BluetoothManager")
 
+    /// Isolated to `managerQueue`
     private var manager: CBCentralManager! = nil
 
+    /// Isolated to `managerQueue`
     private var peripheral: CBPeripheral? {
         get {
             return peripheralManager?.peripheral
@@ -79,26 +97,65 @@ class BluetoothManager: NSObject {
         }
     }
 
-    var peripheralManager: PeripheralManager? {
+    var peripheralIdentifier: UUID? {
+        get {
+            return lockedPeripheralIdentifier.value
+        }
+        set {
+            lockedPeripheralIdentifier.value = newValue
+        }
+    }
+    private let lockedPeripheralIdentifier: Locked<UUID?> = Locked(nil)
+
+    /// Isolated to `managerQueue`
+    private var peripheralManager: PeripheralManager? {
         didSet {
             oldValue?.delegate = nil
             peripheralManager?.delegate = self
+
+            peripheralIdentifier = peripheralManager?.peripheral.identifier
         }
     }
 
-    // MARK: - GCD Management
+    // MARK: - Synchronization
 
-    private let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .utility)
+    private let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
 
     override init() {
         super.init()
 
-        manager = CBCentralManager(delegate: self, queue: managerQueue, options: [CBCentralManagerOptionRestoreIdentifierKey: "com.loudnate.CGMBLEKit"])
+        managerQueue.sync {
+            self.manager = CBCentralManager(delegate: self, queue: managerQueue, options: [CBCentralManagerOptionRestoreIdentifierKey: "com.loudnate.CGMBLEKit"])
+        }
     }
 
     // MARK: - Actions
 
     func scanForPeripheral() {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        managerQueue.sync {
+            self.managerQueue_scanForPeripheral()
+        }
+    }
+
+    func disconnect() {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        managerQueue.sync {
+            if manager.isScanning {
+                manager.stopScan()
+            }
+
+            if let peripheral = peripheral {
+                manager.cancelPeripheralConnection(peripheral)
+            }
+        }
+    }
+
+    private func managerQueue_scanForPeripheral() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         guard manager.state == .poweredOn else {
             return
         }
@@ -108,14 +165,16 @@ class BluetoothManager: NSObject {
             return
         }
 
-        if let peripheralID = self.peripheral?.identifier, let peripheral = manager.retrievePeripherals(withIdentifiers: [peripheralID]).first {
+        if let peripheralID = peripheralIdentifier, let peripheral = manager.retrievePeripherals(withIdentifiers: [peripheralID]).first {
             log.debug("Re-connecting to known peripheral %{public}@", peripheral.identifier.uuidString)
             self.peripheral = peripheral
             self.manager.connect(peripheral)
         } else if let peripheral = manager.retrieveConnectedPeripherals(withServices: [
                 TransmitterServiceUUID.advertisement.cbUUID,
                 TransmitterServiceUUID.cgmService.cbUUID
-            ]).first, delegate == nil || delegate!.bluetoothManager(self, shouldConnectPeripheral: peripheral) {
+            ]).first,
+            delegate == nil || delegate!.bluetoothManager(self, shouldConnectPeripheral: peripheral)
+        {
             log.debug("Found system-connected peripheral: %{public}@", peripheral.identifier.uuidString)
             self.peripheral = peripheral
             self.manager.connect(peripheral)
@@ -129,16 +188,6 @@ class BluetoothManager: NSObject {
         }
     }
 
-    func disconnect() {
-        if manager.isScanning {
-            manager.stopScan()
-        }
-
-        if let peripheral = peripheral {
-            manager.cancelPeripheralConnection(peripheral)
-        }
-    }
-
     /**
     
      Persistent connections don't seem to work with the transmitter shutoff: The OS won't re-wake the
@@ -148,7 +197,7 @@ class BluetoothManager: NSObject {
 
      */
     fileprivate func scanAfterDelay() {
-        DispatchQueue.global(qos: DispatchQoS.QoSClass.utility).async {
+        DispatchQueue.global(qos: .utility).async {
             Thread.sleep(forTimeInterval: 2)
 
             self.scanForPeripheral()
@@ -158,20 +207,30 @@ class BluetoothManager: NSObject {
     // MARK: - Accessors
 
     var isScanning: Bool {
-        return manager.isScanning
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        var isScanning = false
+        managerQueue.sync {
+            isScanning = manager.isScanning
+        }
+        return isScanning
     }
 }
 
 
 extension BluetoothManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         peripheralManager?.centralManagerDidUpdateState(central)
         log.info("%{public}@: %{public}@", #function, String(describing: central.state.rawValue))
 
         switch central.state {
         case .poweredOn:
-            scanForPeripheral()
+            managerQueue_scanForPeripheral()
         case .resetting, .poweredOff, .unauthorized, .unknown, .unsupported:
+            fallthrough
+        @unknown default:
             if central.isScanning {
                 central.stopScan()
             }
@@ -179,6 +238,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] {
             for peripheral in peripherals {
                 if delegate == nil || delegate!.bluetoothManager(self, shouldConnectPeripheral: peripheral) {
@@ -190,6 +251,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         log.info("%{public}@: %{public}@", #function, peripheral)
         if delegate == nil || delegate!.bluetoothManager(self, shouldConnectPeripheral: peripheral) {
             self.peripheral = peripheral
@@ -201,6 +264,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         log.info("%{public}@: %{public}@", #function, peripheral)
         if central.isScanning {
             central.stopScan()
@@ -208,16 +273,20 @@ extension BluetoothManager: CBCentralManagerDelegate {
 
         peripheralManager?.centralManager(central, didConnect: peripheral)
 
-        if case .poweredOn = manager.state, case .connected = peripheral.state {
-            self.delegate?.bluetoothManager(self, isReadyWithError: nil)
+        if case .poweredOn = manager.state, case .connected = peripheral.state, let peripheralManager = peripheralManager {
+            self.delegate?.bluetoothManager(self, peripheralManager: peripheralManager, isReadyWithError: nil)
         }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
         // Ignore errors indicating the peripheral disconnected remotely, as that's expected behavior
         if let error = error as NSError?, CBError(_nsError: error).code != .peripheralDisconnected {
             log.error("%{public}@: %{public}@", #function, error)
-            self.delegate?.bluetoothManager(self, isReadyWithError: error)
+            if let peripheralManager = peripheralManager {
+                self.delegate?.bluetoothManager(self, peripheralManager: peripheralManager, isReadyWithError: error)
+            }
         }
 
         if stayConnected {
@@ -226,8 +295,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        if let error = error {
-            self.delegate?.bluetoothManager(self, isReadyWithError: error)
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
+        if let error = error, let peripheralManager = peripheralManager {
+            self.delegate?.bluetoothManager(self, peripheralManager: peripheralManager, isReadyWithError: error)
         }
 
         if stayConnected {
@@ -256,12 +327,14 @@ extension BluetoothManager: PeripheralManagerDelegate {
         }
 
         switch CGMServiceCharacteristicUUID(rawValue: characteristic.uuid.uuidString.uppercased()) {
-        case .none, .communication?, .authentication?:
+        case .none, .communication?:
             return
         case .control?:
             self.delegate?.bluetoothManager(self, didReceiveControlResponse: value)
         case .backfill?:
             self.delegate?.bluetoothManager(self, didReceiveBackfillResponse: value)
+        case .authentication?:
+            self.delegate?.bluetoothManager(self, peripheralManager: manager, didReceiveAuthenticationResponse: value)
         }
     }
 }

@@ -31,7 +31,7 @@ class CompletionViewController: UITableViewController {
             content.badge = 1
             content.title = navBar.title!
             content.body = textView.text
-            content.sound = .default()
+            content.sound = .default
 
             let request = UNNotificationRequest(identifier: "Completion", content: content, trigger: nil)
 

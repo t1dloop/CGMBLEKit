@@ -27,14 +27,14 @@ class PeripheralManager: NSObject {
             oldValue.delegate = nil
             peripheral.delegate = self
 
-            queue.async {
+            queue.sync {
                 self.needsConfiguration = true
             }
         }
     }
 
     /// The dispatch queue used to serialize operations on the peripheral
-    let queue = DispatchQueue(label: "com.loopkit.PeripheralManager.queue", qos: .utility)
+    let queue = DispatchQueue(label: "com.loopkit.PeripheralManager.queue", qos: .unspecified)
 
     /// The condition used to signal command completion
     private let commandLock = NSCondition()
@@ -45,14 +45,20 @@ class PeripheralManager: NSObject {
     /// Any error surfaced during the active operation
     private var commandError: Error?
 
-    unowned let central: CBCentralManager
+    private(set) weak var central: CBCentralManager?
 
     let configuration: Configuration
 
     // Confined to `queue`
     private var needsConfiguration = true
 
-    weak var delegate: PeripheralManagerDelegate?
+    weak var delegate: PeripheralManagerDelegate? {
+        didSet {
+            queue.sync {
+                needsConfiguration = true
+            }
+        }
+    }
 
     init(peripheral: CBPeripheral, configuration: Configuration, centralManager: CBCentralManager) {
         self.peripheral = peripheral
@@ -99,18 +105,30 @@ protocol PeripheralManagerDelegate: class {
 // MARK: - Operation sequence management
 extension PeripheralManager {
     func configureAndRun(_ block: @escaping (_ manager: PeripheralManager) -> Void) -> (() -> Void) {
-        return { [unowned self] in
+        return {
             if !self.needsConfiguration && self.peripheral.services == nil {
-                self.log.debug("Configured peripheral has no services. Reconfiguring…")
+                self.log.error("Configured peripheral has no services. Reconfiguring…")
             }
 
             if self.needsConfiguration || self.peripheral.services == nil {
                 do {
                     try self.applyConfiguration()
-                    try self.delegate?.completeConfiguration(for: self)
-                    self.needsConfiguration = false
+                    self.log.default("Peripheral configuration completed")
                 } catch let error {
-                    self.log.debug("Error applying configuration: %@", String(describing: error))
+                    self.log.error("Error applying peripheral configuration: %@", String(describing: error))
+                    // Will retry
+                }
+
+                do {
+                    if let delegate = self.delegate {
+                        try delegate.completeConfiguration(for: self)
+                        self.log.default("Delegate configuration completed")
+                        self.needsConfiguration = false
+                    } else {
+                        self.log.error("No delegate set configured")
+                    }
+                } catch let error {
+                    self.log.error("Error applying delegate configuration: %@", String(describing: error))
                     // Will retry
                 }
             }
@@ -168,7 +186,7 @@ extension PeripheralManager {
     func runCommand(timeout: TimeInterval, command: () -> Void) throws {
         // Prelude
         dispatchPrecondition(condition: .onQueue(queue))
-        guard central.state == .poweredOn && peripheral.state == .connected else {
+        guard central?.state == .poweredOn && peripheral.state == .connected else {
             throw PeripheralManagerError.notReady
         }
 
@@ -295,7 +313,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         commandLock.lock()
 
-        if let index = commandConditions.index(where: { (condition) -> Bool in
+        if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .discoverServices = condition {
                 return true
             } else {
@@ -316,7 +334,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         commandLock.lock()
 
-        if let index = commandConditions.index(where: { (condition) -> Bool in
+        if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .discoverCharacteristicsForService(serviceUUID: service.uuid) = condition {
                 return true
             } else {
@@ -337,7 +355,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         commandLock.lock()
 
-        if let index = commandConditions.index(where: { (condition) -> Bool in
+        if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .notificationStateUpdate(characteristic: characteristic, enabled: characteristic.isNotifying) = condition {
                 return true
             } else {
@@ -358,7 +376,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         commandLock.lock()
 
-        if let index = commandConditions.index(where: { (condition) -> Bool in
+        if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .write(characteristic: characteristic) = condition {
                 return true
             } else {
@@ -379,7 +397,9 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         commandLock.lock()
 
-        if let index = commandConditions.index(where: { (condition) -> Bool in
+        var notifyDelegate = false
+
+        if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .valueUpdate(characteristic: characteristic, matching: let matching) = condition {
                 return matching?(characteristic.value) ?? true
             } else {
@@ -395,13 +415,15 @@ extension PeripheralManager: CBPeripheralDelegate {
         } else if let macro = configuration.valueUpdateMacros[characteristic.uuid] {
             macro(self)
         } else if commandConditions.isEmpty {
-            defer { // execute after the unlock
-                // If we weren't expecting this notification, pass it along to the delegate
-                delegate?.peripheralManager(self, didUpdateValueFor: characteristic)
-            }
+            notifyDelegate = true // execute after the unlock
         }
 
         commandLock.unlock()
+
+        if notifyDelegate {
+            // If we weren't expecting this notification, pass it along to the delegate
+            delegate?.peripheralManager(self, didUpdateValueFor: characteristic)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
@@ -431,5 +453,19 @@ extension PeripheralManager: CBCentralManagerDelegate {
         default:
             break
         }
+    }
+}
+
+
+extension PeripheralManager {
+    public override var debugDescription: String {
+        var items = [
+            "## PeripheralManager",
+            "peripheral: \(peripheral)",
+        ]
+        queue.sync {
+            items.append("needsConfiguration: \(needsConfiguration)")
+        }
+        return items.joined(separator: "\n")
     }
 }
